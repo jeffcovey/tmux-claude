@@ -1,0 +1,155 @@
+#!/bin/sh
+set -e
+
+CLAUDE_SESSIONS_DIR="$HOME/.claude/sessions"
+
+usage() {
+    echo "Usage: $(basename "$0") [session-name]"
+    echo ""
+    echo "  No arguments: list and choose from existing sessions"
+    echo "  session-name: attach or create a tmux+claude session with that name"
+    exit 1
+}
+
+# Extract a field value from a single-line JSON file
+# Usage: json_field file key
+json_field() {
+    grep -o "\"$2\" *: *\"[^\"]*\"" "$1" | head -1 | sed "s/^\"$2\" *: *\"//;s/\"$//"
+}
+
+# Collect unique session names from tmux and Claude session files, one per line
+# For unnamed Claude sessions, falls back to basename of cwd
+get_session_names() {
+    {
+        # Tmux session names
+        tmux list-sessions -F '#{session_name}' 2>/dev/null || true
+
+        # Claude session names from JSON files
+        if [ -d "$CLAUDE_SESSIONS_DIR" ]; then
+            for f in "$CLAUDE_SESSIONS_DIR"/*.json; do
+                [ -f "$f" ] || continue
+                name=$(json_field "$f" name)
+                if [ -n "$name" ]; then
+                    echo "$name"
+                else
+                    # Fall back to basename of cwd
+                    cwd=$(json_field "$f" cwd)
+                    if [ -n "$cwd" ]; then
+                        basename "$cwd"
+                    fi
+                fi
+            done
+        fi
+    } | grep . | sort -u
+}
+
+# Find the Claude session ID for a given display name (or cwd basename fallback)
+# Prints the sessionId if found, empty otherwise.
+# If multiple sessions match, picks the most recently modified file.
+find_claude_session_id() {
+    target="$1"
+    best_file=""
+    if [ -d "$CLAUDE_SESSIONS_DIR" ]; then
+        for f in "$CLAUDE_SESSIONS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            file_name=$(json_field "$f" name)
+            if [ -z "$file_name" ]; then
+                cwd=$(json_field "$f" cwd)
+                [ -n "$cwd" ] && file_name=$(basename "$cwd")
+            fi
+            if [ "$file_name" = "$target" ]; then
+                # Keep the last match (newest file wins by glob order)
+                best_file="$f"
+            fi
+        done
+    fi
+    if [ -n "$best_file" ]; then
+        json_field "$best_file" sessionId
+    fi
+}
+
+# Attach to existing tmux session or create a new one with claude
+attach_or_create() {
+    name="$1"
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        exec tmux attach-session -t "=$name"
+    else
+        session_id=$(find_claude_session_id "$name")
+        if [ -n "$session_id" ]; then
+            claude_cmd="claude --resume '$session_id'"
+        else
+            claude_cmd="claude -n '$name'"
+        fi
+        tmux new-session -d -s "$name" "$claude_cmd"
+        tmux new-window -t "=$name"
+        exec tmux attach-session -t "=$name:0"
+    fi
+}
+
+# If a name was given directly, use it
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    usage
+fi
+
+if [ -n "$1" ]; then
+    attach_or_create "$1"
+fi
+
+# Interactive mode: build list into a temp file to handle spaces in names
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT
+get_session_names > "$tmpfile"
+
+if [ ! -s "$tmpfile" ]; then
+    echo "No existing sessions found."
+    printf "Enter a name for a new session: "
+    read -r name
+    [ -z "$name" ] && exit 1
+    attach_or_create "$name"
+fi
+
+echo "Sessions:"
+echo ""
+i=1
+while IFS= read -r name; do
+    tmux_flag=" "
+    claude_flag=" "
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        tmux_flag="T"
+    fi
+    if [ -d "$CLAUDE_SESSIONS_DIR" ]; then
+        for f in "$CLAUDE_SESSIONS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            file_name=$(json_field "$f" name)
+            if [ -z "$file_name" ]; then
+                cwd=$(json_field "$f" cwd)
+                [ -n "$cwd" ] && file_name=$(basename "$cwd")
+            fi
+            if [ "$file_name" = "$name" ]; then
+                claude_flag="C"
+                break
+            fi
+        done
+    fi
+    printf "  %d) [%s%s] %s\n" "$i" "$tmux_flag" "$claude_flag" "$name"
+    i=$((i + 1))
+done < "$tmpfile"
+
+echo ""
+echo "  T = tmux session active, C = claude session exists"
+echo ""
+printf "Pick a number, or type a new session name: "
+read -r choice
+
+# Check if input is a number
+if echo "$choice" | grep -qE '^[0-9]+$'; then
+    name=$(sed -n "${choice}p" "$tmpfile")
+    if [ -n "$name" ]; then
+        attach_or_create "$name"
+    fi
+    echo "Invalid selection." >&2
+    exit 1
+else
+    [ -z "$choice" ] && exit 1
+    attach_or_create "$choice"
+fi
